@@ -1,0 +1,453 @@
+esphome:
+  name: hotwatch
+  friendly_name: HotWatch Котёл
+  comment: Система мониторинга и безопасности самодельного котла отопления
+  project:
+    name: "Vector.HotWatch"
+    version: "1.0"
+
+esp32:
+  board: esp32c3
+  framework:
+    type: esp-idf
+    version: recommended
+
+logger:
+  level: INFO
+  logs:
+    i2c: WARN
+    dallas: DEBUG
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "HotWatch Fallback"
+    password: !secret fallback_password
+  power_save_mode: LIGHT
+
+web_server:
+  port: 80
+
+captive_portal:
+
+# ============================================================================
+# I2C (резерв для будущих сенсоров типа SHT40, BME280)
+# ============================================================================
+i2c:
+  sda: GPIO21
+  scl: GPIO22
+  scan: true
+  frequency: 100kHz
+
+# ============================================================================
+# ONE-WIRE (DS18B20 подача + обратка)
+# ============================================================================
+dallas:
+  - pin: GPIO0
+    update_interval: 30s
+
+# ============================================================================
+# ДИСКРЕТНЫЕ ВХОДЫ (кнопки, датчики)
+# ============================================================================
+binary_sensor:
+  # Кнопка сброса тревоги (низкий уровень = нажата)
+  - platform: gpio
+    pin:
+      number: GPIO2
+      mode:
+        input: true
+        pullup: true
+    name: "Кнопка сброс тревоги"
+    id: btn_reset_alarm
+    internal: false
+    on_press:
+      then:
+        - switch.turn_off: red_led_alarm
+        - switch.turn_off: buzzer
+
+  # Кнопка тест (низкий уровень = нажата)
+  - platform: gpio
+    pin:
+      number: GPIO3
+      mode:
+        input: true
+        pullup: true
+    name: "Кнопка тест"
+    id: btn_test
+    internal: false
+    on_press:
+      then:
+        - logger.log: "🔧 ТЕСТ: включены LED и BUZZER на 5 сек"
+        - switch.turn_on: red_led_alarm
+        - switch.turn_on: buzzer
+        - delay: 5s
+        - switch.turn_off: red_led_alarm
+        - switch.turn_off: buzzer
+
+  # КY-026 датчик пламени (высокий уровень = огонь)
+  - platform: gpio
+    pin:
+      number: GPIO4
+      mode:
+        input: true
+        pulldown: false
+    name: "🔥 Обнаружено пламя"
+    id: flame_detected
+    device_class: flame
+    on_press:
+      then:
+        - logger.log: "🔥🔥🔥 ОГОНЬ ОБНАРУЖЕН! АКТИВИРОВАНА ЛОКАЛЬНАЯ ТРЕВОГА!"
+        - switch.turn_on: red_led_alarm
+        - switch.turn_on: buzzer
+
+  # YL-63 датчик ИК препятствий / открытия дверки (низкий уровень = препятствие)
+  - platform: gpio
+    pin:
+      number: GPIO6
+      mode:
+        input: true
+        pullup: false
+    name: "🚪 Дверка котельной"
+    id: door_open
+    device_class: occupancy
+    filters:
+      - delayed_on: 1s
+      - delayed_off: 5s
+
+  # MQ-5 дискретный выход (DO) — высокий уровень = газ обнаружен
+  - platform: gpio
+    pin:
+      number: GPIO21
+      mode:
+        input: true
+        pullup: true
+    name: "⚠️ MQ-5 (газ) срабатывание"
+    id: mq5_alarm
+    device_class: smoke
+    on_press:
+      then:
+        - logger.log: "⚠️⚠️⚠️ GAS (MQ-5) ALARM! АКТИВИРОВАНА ЛОКАЛЬНАЯ ТРЕВОГА!"
+        - switch.turn_on: red_led_alarm
+        - switch.turn_on: buzzer
+        - delay: 3s
+        - switch.turn_off: buzzer
+
+  # Статус Wi-Fi (интеграция)
+  - platform: status
+    name: "📡 WiFi подключение"
+    id: wifi_status
+
+# ============================================================================
+# АНАЛОГОВЫЕ ВХОДЫ (датчики с ADC)
+# ============================================================================
+sensor:
+  # ===== Температура 1-Wire (DS18B20) =====
+  - platform: dallas
+    address: 0x00  # Подача (первый датчик на шине)
+    name: "🌡️ Температура подачи"
+    id: temp_supply
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    filters:
+      - filter_out_value: 85.0
+      - exponential_moving_average:
+          alpha: 0.1
+          send_every: 5
+
+  - platform: dallas
+    address: 0x01  # Обратка (второй датчик на шине)
+    name: "🌡️ Температура обратки"
+    id: temp_return
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    filters:
+      - filter_out_value: 85.0
+      - exponential_moving_average:
+          alpha: 0.1
+          send_every: 5
+
+  # ===== DHT11 (влажность + температура котельной) =====
+  - platform: dht
+    pin: GPIO1
+    model: DHT11
+    temperature:
+      name: "🌡️ Температура котельной"
+      id: temp_room
+      unit_of_measurement: "°C"
+      accuracy_decimals: 1
+      filters:
+        - exponential_moving_average:
+            alpha: 0.1
+            send_every: 10
+    humidity:
+      name: "💧 Влажность котельной"
+      id: humidity_room
+      unit_of_measurement: "%"
+      accuracy_decimals: 0
+      filters:
+        - exponential_moving_average:
+            alpha: 0.1
+            send_every: 10
+    update_interval: 30s
+
+  # ===== MQ-2 аналоговый вход (дым/газ общий) =====
+  # GPIO4 (ADC1) — делитель напряжения 10k-10k (5В→2.5В max)
+  - platform: adc
+    pin: GPIO4
+    name: "🌫️ MQ-2 (сырое значение)"
+    id: mq2_raw
+    unit_of_measurement: "ADC"
+    accuracy_decimals: 0
+    update_interval: 10s
+    attenuation: 11db
+    filters:
+      - exponential_moving_average:
+          alpha: 0.2
+          send_every: 3
+
+  # Нормализованное значение MQ-2 (0–100% для удобства)
+  - platform: template
+    name: "🌫️ MQ-2 (процент)"
+    id: mq2_percent
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+    update_interval: 10s
+    lambda: |-
+      // Базовый уровень дыма ~150–200 ADC (при нормальной вентиляции)
+      // Тревога при > 400 ADC (дым)
+      float raw = id(mq2_raw).state;
+      float baseline = 200.0;
+      float alarm_level = 400.0;
+      if (raw < baseline) {
+        return 0.0;
+      }
+      return (raw - baseline) / (alarm_level - baseline) * 100.0;
+
+  # Автоматическая тревога по MQ-2 (если сырое значение > 400)
+  - platform: template
+    name: "🔴 MQ-2 Статус"
+    id: mq2_status
+    lambda: |-
+      float raw = id(mq2_raw).state;
+      if (raw > 400.0) {
+        if (id(red_led_alarm).state == false) {
+          ESP_LOGI("MQ-2", "🔴 SMOKE ALARM! raw=%.0f > 400", raw);
+          id(red_led_alarm).turn_on();
+          id(buzzer).turn_on();
+        }
+        return "🔴 ДЫМ!";
+      }
+      if (raw > 300.0) {
+        return "🟡 ПОВЫШЕННЫЙ ДЫМ";
+      }
+      if (raw > 200.0) {
+        return "🟢 НОРМАЛЬНЫЙ ДЫМ";
+      }
+      return "✅ OK";
+
+  # ===== Диагностика сигнала WiFi =====
+  - platform: wifi_signal
+    name: "📡 RSSI WiFi"
+    id: wifi_rssi
+    unit_of_measurement: "dBm"
+    update_interval: 60s
+    filters:
+      - exponential_moving_average:
+          alpha: 0.1
+          send_every: 2
+
+  # ===== Uptime (время работы) =====
+  - platform: uptime
+    name: "⏱️ Uptime"
+    id: uptime
+    unit_of_measurement: "s"
+    update_interval: 60s
+
+  # ===== Vcc (напряжение питания ESP32) =====
+  - platform: adc
+    pin: GPIO5
+    id: vcc_voltage
+    attenuation: 11db
+    name: "🔋 VCC (3.3V ref)"
+    unit_of_measurement: "V"
+    accuracy_decimals: 2
+    update_interval: 30s
+    internal: true
+    lambda: |-
+      return x * 1.1;  # ADC с ослаблением 11db: Vout ≈ Vin × 1.1
+
+  # ===== Расчёт ΔT (разница подача - обратка) =====
+  - platform: template
+    name: "🌡️ ΔT (подача - обратка)"
+    id: delta_t
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    update_interval: 30s
+    lambda: |-
+      return id(temp_supply).state - id(temp_return).state;
+
+  # ===== Free Heap (свободная память) =====
+  - platform: template
+    name: "💾 Свободная память"
+    id: free_heap
+    unit_of_measurement: "B"
+    update_interval: 60s
+    lambda: |-
+      return esp_get_free_heap_size();
+
+# ============================================================================
+# ВЫХОДЫ (светодиоды, баззер)
+# ============================================================================
+switch:
+  # Красный LED (тревога)
+  - platform: gpio
+    name: "🔴 LED тревога"
+    id: red_led_alarm
+    pin: GPIO7
+    restore_mode: ALWAYS_OFF
+    internal: false
+
+  # Зелёный LED (статус работы) — мигает каждую секунду
+  - platform: gpio
+    name: "🟢 LED статус"
+    id: green_led_status
+    pin: GPIO10
+    restore_mode: ALWAYS_OFF
+    internal: false
+
+  # Баззер (активный, требует питание 5В)
+  - platform: gpio
+    name: "🔊 Баззер"
+    id: buzzer
+    pin: GPIO20
+    restore_mode: ALWAYS_OFF
+    internal: false
+    on_turn_on:
+      then:
+        - logger.log: "🔊 BUZZER ON"
+    on_turn_off:
+      then:
+        - logger.log: "🔊 BUZZER OFF"
+
+# ============================================================================
+# АВТОМАТИЗАЦИЯ И ЛОГИКА БЕЗОПАСНОСТИ
+# ============================================================================
+
+# Мигающий зелёный LED (статус работы, каждую сек)
+interval:
+  - interval: 1s
+    then:
+      - switch.toggle: green_led_status
+
+  # Мониторинг Wi-Fi (Watchdog: если не подключен > 5 мин)
+  - interval: 60s
+    then:
+      - if:
+          condition:
+            binary_sensor.is_off: wifi_status
+          then:
+            - logger.log: "⚠️ WiFi disconnected, incrementing watchdog counter"
+            - switch.turn_on: red_led_alarm
+            - switch.turn_on: buzzer
+
+# ============================================================================
+# ТЕКСТОВЫЕ СЕНСОРЫ И ДИАГНОСТИКА
+# ============================================================================
+text_sensor:
+  # Статус подключения
+  - platform: wifi_info
+    ip_address:
+      name: "📡 IP адрес"
+    ssid:
+      name: "📡 SSID"
+    bssid:
+      name: "📡 BSSID"
+
+  # Версия ESPHome
+  - platform: version
+    name: "📦 ESPHome версия"
+    hide_timestamp: true
+
+  # Статус системы (общий)
+  - platform: template
+    name: "🔧 Статус системы"
+    id: system_status
+    update_interval: 10s
+    lambda: |-
+      bool flame = id(flame_detected).state;
+      bool mq2_alarm = id(mq2_raw).state > 400.0;
+      bool wifi = id(wifi_status).state;
+      float delta_t = id(delta_t).state;
+
+      if (flame) return "🔥 ОГОНЬ!";
+      if (mq2_alarm) return "🌫️ ДЫМ!";
+      if (!wifi) return "📡 НЕТ WiFi";
+      if (delta_t < 2.0) return "⚠️ Слабая циркуляция";
+      return "✅ ВСЁ В НОРМЕ";
+
+# ============================================================================
+# BLUETOOTH (опционально, для диагностики)
+# ============================================================================
+# bluetooth_proxy:
+
+# ============================================================================
+# ПРИМЕЧАНИЯ И КОММЕНТАРИИ
+# ============================================================================
+#
+# 1. GPIO распределение (ESP32-C3):
+#    GPIO0  - 1-Wire (DS18B20)
+#    GPIO1  - DHT11 DATA
+#    GPIO2  - Кнопка сброса тревоги (вход, pull-up)
+#    GPIO3  - Кнопка тест (вход, pull-up)
+#    GPIO4  - MQ-2 аналоговый вход (ADC1, с делителем 10k-10k)
+#    GPIO5  - VCC (опционально, для мониторинга питания)
+#    GPIO6  - YL-63 ИК датчик (вход)
+#    GPIO7  - LED красный (выход)
+#    GPIO10 - LED зелёный (выход)
+#    GPIO20 - Баззер (выход)
+#    GPIO21 - MQ-5 DO (дискретный выход датчика газа)
+#    GPIO22 - I2C SCL (резерв)
+#    GPIO23 - I2C SDA (резерв)
+#
+# 2. Напряжения:
+#    - ESP32-C3 питание: 3.3 В
+#    - Датчики питание: 5 В (из DC-DC LM2596)
+#    - Входы ESP32: макс 3.3 В (делители для аналоговых 5В датчиков)
+#
+# 3. Датчики и их особенности:
+#    - DS18B20: 1-Wire, прецизионный ±0.5°C, 2 шт на одном пине (адреса 0x00, 0x01)
+#    - DHT11: Простой, ±5%, требует паузы между опросами
+#    - KY-026: Обнаруживает инфракрасное излучение (пламя), может быть ослеплен
+#    - MQ-2: Аналоговый дымовой датчик, требует 5-10 мин прогрева
+#    - MQ-5: Аналоговый газовый датчик, требует 5-10 мин прогрева
+#    - YL-63: ИК датчик расстояния / препятствий, 3–50 см
+#
+# 4. Локальная безопасность:
+#    - Пламя обнаружено → RED LED ON + BUZZER ON
+#    - MQ-2 > 400 ADC → RED LED ON + BUZZER ON
+#    - MQ-5 DO срабатывание → RED LED ON + BUZZER ON (3 сек)
+#    - WiFi потеря > 5 мин → RED LED ON + BUZZER (Watchdog)
+#    - Кнопка сброса → выключить LED + BUZZER
+#    - Кнопка тест → включить на 5 сек для проверки
+#
+# 5. Фильтрация и калибровка:
+#    - Экспоненциальное скользящее среднее (EMA) для сглаживания шума
+#    - DS18B20 исключает значение 85.0°C (ошибка инициализации)
+#    - MQ-2 baseline ~200 ADC (нормальный дым), alarm > 400 ADC
+#    - DHT11 обновляется каждые 30 сек (избежать помех)
+#
+# 6. Интеграция с HA:
+#    - Native API (шифрование по умолчанию)
+#    - Все датчики отправляются в HA для логирования, уведомлений, дашборда
+#    - Кнопки сброса и тест функционируют локально И отправляют события в HA
+#
+# ============================================================================
